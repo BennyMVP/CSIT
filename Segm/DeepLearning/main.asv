@@ -1,0 +1,200 @@
+%% =========================================================
+%  SEGMENTAZIONE BRAIN MRI - DEEP LEARNING (SynthSeg-based)
+%  Pipeline: predizione + confronto con Ground Truth + metriche
+%
+%  NOTA: le funzioni helper sono nei file separati
+%  (preProcessBrainCANDIData.m, postProcessBrainCANDIData.m,
+%   alignBrainCANDIVolume.m, getBrainCANDISegmentationLabels.m,
+%   downloadTrainedNetwork.m).
+% =========================================================
+clearvars; clc; close all;
+
+%% 1. DOWNLOAD DATASET
+zipFile  = matlab.internal.examples.downloadSupportFile("image","data/brainSegData.zip");
+filepath = fileparts(zipFile);
+if ~exist(fullfile(filepath,"brainSegData"),'dir')
+    unzip(zipFile,filepath);
+end
+dataDir = fullfile(filepath,"brainSegData");
+
+%% 2. LOAD / SAVE RETE PRETRAINED
+netFile = fullfile(dataDir,"trainedSynthSegModel.mat");
+if isfile(netFile)
+    fprintf(">> Caricamento rete dal file locale .mat...\n");
+    load(netFile,"net");
+else
+    fprintf(">> Download e importazione rete (lento)...\n");
+    trainedURL = "https://www.mathworks.com/supportfiles/image/data/trainedSynthSegModel.zip";
+    downloadTrainedNetwork(trainedURL,dataDir);
+    net = importNetworkFromTensorFlow(fullfile(dataDir,"trainedSynthSegModel"));
+    save(netFile,"net","-v7.3");
+    fprintf(">> Rete salvata in locale per i prossimi run.\n");
+end
+
+%% 3. CARICAMENTO MRI E LABELS
+imFile   = fullfile(dataDir,"anat.nii.gz");
+metaData = niftiinfo(imFile);
+vol      = double(niftiread(metaData));
+[classNames,labelIDs] = getBrainCANDISegmentationLabels;
+
+%% 4. PREPROCESSING + PREDIZIONE (con TTA flip)
+resample = false;
+cropSize = 192;
+[volProc,cropIdx,imSize] = preProcessBrainCANDIData(vol,metaData,cropSize,resample);
+
+fprintf(">> Inferenza in corso...\n");
+predictIm = predict(net,dlarray(single(volProc),"SSSCB"));
+
+% Test Time Augmentation (left-right flip)
+flippedData   = flip(flip(fliplr(volProc),2),1);
+flipPredictIm = predict(net,dlarray(single(flippedData),"SSSCB"));
+
+predictedSegMaps = postProcessBrainCANDIData(predictIm,flipPredictIm, ...
+    imSize,cropIdx,metaData,classNames,labelIDs);
+
+%% 5. CARICAMENTO GROUND TRUTH (annotazioni dell'esperto)
+labelDirs = fullfile(dataDir,"groundTruth");
+pxds = pixelLabelDatastore(labelDirs,classNames,labelIDs, ...
+    'FileExtensions',".gz", ...
+    'ReadFcn',@(X) uint8(niftiread(X)));
+groundTruthLabel = read(pxds);
+groundTruthLabel = groundTruthLabel{1};
+
+%% 6. CONFRONTO QUALITATIVO: MRI / GROUND TRUTH / PREDIZIONE
+% Una figura per vista (assiale, coronale) con tre pannelli affiancati.
+
+sliceIdxAssiale  = 115;     % dim 2 = piano assiale in questo volume
+sliceIdxCoronale = 80;      % dim 3 = piano coronale
+
+% --- VISTA ASSIALE ---
+mriA   = rescale(squeeze(vol(:,sliceIdxAssiale,:)));
+gtA    = squeeze(groundTruthLabel(:,sliceIdxAssiale,:));
+predA  = squeeze(predictedSegMaps(:,sliceIdxAssiale,:));
+
+gtOverlayA   = labeloverlay(mriA,gtA,  "IncludedLabels",classNames(2:end));
+predOverlayA = labeloverlay(mriA,predA,"IncludedLabels",classNames(2:end));
+
+% Rotazione per orientamento radiologico standard
+mriAd          = imrotate(mriA,90);
+gtOverlayAd    = imrotate(gtOverlayA,90);
+predOverlayAd  = imrotate(predOverlayA,90);
+
+figure('Color','white','Name','Confronto Assiale: MRI / GT / Predizione', ...
+       'Position',[100 100 1200 400]);
+subplot(1,3,1), imshow(mriAd,[]),     title(['MRI originale (slice ' num2str(sliceIdxAssiale) ')'])
+subplot(1,3,2), imshow(gtOverlayAd),  title('Ground Truth (esperto clinico)')
+subplot(1,3,3), imshow(predOverlayAd),title('Predizione AI (SynthSeg)')
+
+% --- VISTA CORONALE ---
+mriC   = rescale(vol(:,:,sliceIdxCoronale));
+gtC    = groundTruthLabel(:,:,sliceIdxCoronale);
+predC  = predictedSegMaps(:,:,sliceIdxCoronale);
+
+gtOverlayC   = labeloverlay(mriC,gtC,  "IncludedLabels",classNames(2:end));
+predOverlayC = labeloverlay(mriC,predC,"IncludedLabels",classNames(2:end));
+
+mriCd         = permute(mriC,[2 1]);
+gtOverlayCd   = permute(gtOverlayC,[2 1 3]);
+predOverlayCd = permute(predOverlayC,[2 1 3]);
+
+figure('Color','white','Name','Confronto Coronale: MRI / GT / Predizione', ...
+       'Position',[100 550 1200 400]);
+subplot(1,3,1), imshow(mriCd,[]),     title(['MRI originale (slice ' num2str(sliceIdxCoronale) ')'])
+subplot(1,3,2), imshow(gtOverlayCd),  title('Ground Truth (esperto clinico)')
+subplot(1,3,3), imshow(predOverlayCd),title('Predizione AI (SynthSeg)')
+
+%% 7. ERROR MAP: dove il modello sbaglia
+% Pixel rossi = predizione diversa dalla ground truth.
+
+errorMap   = (groundTruthLabel ~= predictedSegMaps);
+errorA     = imrotate(squeeze(errorMap(:,sliceIdxAssiale,:)),90);
+
+figure('Color','white','Name','Error Map (assiale)');
+imshow(mriAd,[]); hold on
+red = cat(3,ones(size(errorA)),zeros(size(errorA)),zeros(size(errorA)));
+h = imshow(red); set(h,'AlphaData',0.5*double(errorA));
+title('Pixel sbagliati (rosso) sovrapposti alla MRI'); hold off
+
+%% 8. METRICHE QUANTITATIVE: Dice + IoU per classe
+diceResult = zeros(length(classNames),1);
+iouResult  = zeros(length(classNames),1);
+for j = 1:length(classNames)
+    gtMask   = (groundTruthLabel == classNames(j));
+    predMask = (predictedSegMaps  == classNames(j));
+    diceResult(j) = dice(gtMask,predMask);
+    iouResult(j)  = jaccard(gtMask,predMask);
+end
+
+meanDice   = mean(diceResult);
+medianDice = median(diceResult);
+meanIoU    = mean(iouResult);
+
+fprintf('\n=========================================\n');
+fprintf('  METRICHE DI SEGMENTAZIONE - GLOBALI\n');
+fprintf('=========================================\n');
+fprintf('  Mean Dice  (DSC)     = %.4f\n', meanDice);
+fprintf('  Median Dice          = %.4f\n', medianDice);
+fprintf('  Mean IoU   (Jaccard) = %.4f\n', meanIoU);
+fprintf('=========================================\n');
+
+%% 9. BAR CHART: Dice per classe (ordinato)
+[diceSorted,sortIdx] = sort(diceResult,'descend');
+classSorted = classNames(sortIdx);
+
+figure('Color','white','Name','Dice per classe','Position',[100 100 900 700]);
+barh(diceSorted,'FaceColor',[0.3 0.5 0.8])
+yticks(1:length(classNames))
+yticklabels(classSorted)
+set(gca,'TickLabelInterpreter','none','YDir','reverse','FontSize',9)
+xlim([0 1])
+xlabel('Dice coefficient')
+title(sprintf('Dice per classe (mean = %.3f)',meanDice))
+grid on
+hold on
+xline(0.8,'r--','Dice = 0.80','LabelOrientation','horizontal','LineWidth',1.2)
+xline(meanDice,'k:',sprintf('mean = %.2f',meanDice), ...
+      'LabelOrientation','horizontal','LineWidth',1.2)
+hold off
+
+%% 10. BOX PLOT della distribuzione Dice
+figure('Color','white','Name','Distribuzione Dice');
+boxchart(diceResult)
+title(sprintf('Dice Accuracy   (mean = %.3f,  median = %.3f)', ...
+      meanDice,medianDice))
+xticklabels("All Label Classes")
+ylabel('Dice Coefficient')
+ylim([0 1]); grid on
+
+%% 11. CONFUSION MATRIX (senza background)
+% Il background occupa ~85% dei voxel: lo escludiamo per leggere
+% le confusioni tra le strutture anatomiche di interesse.
+
+gtVec   = groundTruthLabel(:);
+predVec = predictedSegMaps(:);
+
+mask = (gtVec ~= "background");
+gtVec   = gtVec(mask);
+predVec = predVec(mask);
+
+figure('Color','white','Name','Confusion Matrix', ...
+       'Position',[100 100 1000 900]);
+cm = confusionchart(gtVec,predVec, ...
+    'RowSummary','row-normalized', ...
+    'ColumnSummary','column-normalized', ...
+    'Title','Confusion Matrix (background escluso)');
+cm.FontSize = 8;
+
+% Ordina le classi mettendo in alto quelle con recall più alto
+% (diagonale decrescente). Più leggibile per la slide.
+sortClasses(cm,'descending-diagonal');
+
+%% 12. TABELLA RIASSUNTIVA: stampa metriche per classe
+fprintf('\n%-32s | %-7s | %-7s\n','Class','Dice','IoU');
+fprintf('%s\n',repmat('-',1,55));
+for j = 1:length(classNames)
+    fprintf('%-32s | %.4f  | %.4f\n', ...
+        classNames(j),diceResult(j),iouResult(j));
+end
+fprintf('%s\n',repmat('-',1,55));
+fprintf('%-32s | %.4f  | %.4f\n','MEAN',meanDice,meanIoU);
+fprintf('%-32s | %.4f  | %s\n',   'MEDIAN',medianDice,'   -   ');
